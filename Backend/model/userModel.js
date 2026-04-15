@@ -10,6 +10,12 @@ const userSchema = new mongoose.Schema({
         required: true,
         unique: true
     },
+    phoneNumber: {
+        type: String,
+        unique: true,
+        sparse: true, // Users without a phone number can still exist
+        index: true
+    },
     password: {
         type: String,
         required: true
@@ -51,6 +57,17 @@ const userSchema = new mongoose.Schema({
     outgoingRequests: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: "user"
+    }],
+    suggestedContacts: {
+        matchedUsers: { type: Array, default: [] },
+        unmatchedContacts: { type: Array, default: [] },
+        lastSynced: { type: Date }
+    },
+    requestHistory: [{
+        user: { type: mongoose.Schema.Types.ObjectId, ref: "user" },
+        type: { type: String, enum: ["incoming", "outgoing"] },
+        status: { type: String, enum: ["accepted", "rejected"] },
+        at: { type: Date, default: Date.now }
     }]
 }, { timestamps: true });
 

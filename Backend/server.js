@@ -23,8 +23,10 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 4000;
 
+const allowedOrigins = ["http://localhost:3000", "http://127.0.0.1:3000", "https://20nxk7hn-3000.usw3.devtunnels.ms"];
+
 app.use(cors({
-    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    origin: allowedOrigins,
     credentials: true
 }));
 app.use(cookieParser());
@@ -33,7 +35,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // ── REST API Routes ──────────────────────────────────────────────
 app.get("/", (req, res) => res.send("Server is running"));
-app.use("/auth", authRoute);
+app.use("/api/auth", authRoute);
 app.use("/api/users", userRouter);
 app.use("/api", conversationRouter);
 app.use("/api", messageRouter);
@@ -44,7 +46,7 @@ app.use("/api/google", googleRouter);
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "http://localhost:3000",
+        origin: allowedOrigins,
         credentials: true
     }
 });
@@ -58,13 +60,30 @@ const socketToUserId = {}; // socketId -> userId
 io.on("connection", (socket) => {
     console.log("User Connected:", socket.id);
 
-    socket.on("register_socket", (userId) => {
+    socket.on("register_socket", async (userId) => {
         if (!userId) return;
         users[userId] = socket.id;
         socketToUserId[socket.id] = userId;
         console.log(`User Registered: ${userId} on socket ${socket.id}`);
-        // Notify others that this user is now online
-        io.emit("status_change", { userId, status: "online" });
+        
+        // UPDATE DATABASE: Set user as online
+        try {
+            const user = await userModel.findByIdAndUpdate(userId, { isOnline: true }, { new: true }).populate("contacts", "_id");
+            
+            // Notify only "ACCEPTED" friends that this user is now online
+            const onlineFriends = user.contacts
+                .map(f => f._id.toString())
+                .filter(fid => users[fid]);
+
+            onlineFriends.forEach(friendId => {
+                io.to(users[friendId]).emit("UPDATE_USER_STATUS", { userId, status: "online" });
+            });
+        } catch (err) {
+            console.error("Presence update failed (Register):", err);
+        }
+
+        // Send the list of all currently online users to the newly connected user
+        socket.emit("online_users_list", Object.keys(users));
     });
 
     socket.on("join_room", (conversationId) => {
@@ -102,10 +121,12 @@ io.on("connection", (socket) => {
         if (targetSocketId) {
             io.to(targetSocketId).emit("contact_request_accepted", { accepterData });
         }
+        // Also notify the accepter themselves (to refresh their own sidebar/contacts)
+        socket.emit("contact_request_accepted", { accepterData });
     });
 
     // ── Call Events ──────────────────────────────────────────────
-    socket.on("callUser", ({ receiverId, callerId, callerName, callerPic, conversationId, signal, callRecordId }) => {
+    socket.on("callUser", ({ receiverId, callerId, callerName, callerPic, conversationId, signal, callRecordId, isVideo }) => {
         const receiverSocketId = users[receiverId];
         if (!receiverSocketId) {
             socket.emit("userOffline");
@@ -118,6 +139,7 @@ io.on("connection", (socket) => {
             conversationId,
             signal,
             callRecordId,
+            isVideo,
         });
     });
 
@@ -160,19 +182,7 @@ io.on("connection", (socket) => {
     });
 
     // ── Contact Requests Real-time ────────────────────────────────
-    socket.on("contact_request_sent", ({ targetUserId, senderName }) => {
-        const targetSocketId = users[targetUserId];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("receive_contact_request", { senderName });
-        }
-    });
 
-    socket.on("contact_request_accepted", ({ targetUserId, senderName }) => {
-        const targetSocketId = users[targetUserId];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("contact_request_accepted", { senderName });
-        }
-    });
 
     socket.on("disconnect", async () => {
         const userId = socketToUserId[socket.id];
@@ -180,10 +190,26 @@ io.on("connection", (socket) => {
             delete users[userId];
             delete socketToUserId[socket.id];
             try {
-                await userModel.findByIdAndUpdate(userId, { lastSeen: new Date() });
-                io.emit("status_change", { userId, status: "offline" });
+                // UPDATE DATABASE: Set user as offline
+                const user = await userModel.findByIdAndUpdate(userId, { 
+                    isOnline: false, 
+                    lastSeen: new Date() 
+                }, { new: true }).populate("contacts", "_id");
+
+                if (user) {
+                    // Notify only friends that this user is now offline
+                    const onlineFriends = user.contacts
+                        .map(f => f._id.toString())
+                        .filter(fid => users[fid]);
+
+                    onlineFriends.forEach(friendId => {
+                        io.to(users[friendId]).emit("UPDATE_USER_STATUS", { userId, status: "offline" });
+                    });
+                }
+                
+                io.emit("status_change", { userId, status: "offline" }); 
             } catch (err) {
-                console.error("Error updating lastSeen:", err);
+                console.error("Presence update failed (Disconnect):", err);
             }
         }
         console.log("User Disconnected:", socket.id);

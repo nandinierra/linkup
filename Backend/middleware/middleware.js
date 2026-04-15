@@ -6,6 +6,7 @@ export  function verifyToken(req, res, next){
    const Token= req.cookies.jwt_token;
    // console.log("Token",  Token)
    if(!Token){
+      console.log(`[Auth] No token found for ${req.method} ${req.originalUrl}`);
       return res.status(401).json({
          message:"Unauthorized"
       })}

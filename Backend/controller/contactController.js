@@ -1,34 +1,61 @@
 import userModel from "../model/userModel.js";
+import ContactRequest from "../model/ContactRequest.js";
 
 // ── Send Contact Request ─────────────────────────────────────
 export const sendRequest = async (req, res) => {
     try {
         const { targetUserId } = req.body;
-        const myId = req.user.id; // Corrected from _id
+        const myId = req.user.id;
 
         if (!myId) return res.status(401).json({ message: "Unauthorized. User ID missing." });
         if (myId.toString() === targetUserId) return res.status(400).json({ message: "Cannot add yourself." });
 
+        // Check if a relationship already exists in the Friendship table (ContactRequest)
+        const existingRequest = await ContactRequest.findOne({
+            $or: [
+                { sender: myId, receiver: targetUserId },
+                { sender: targetUserId, receiver: myId }
+            ]
+        });
+
+        if (existingRequest) {
+            if (existingRequest.status === "pending") {
+                return res.status(400).json({ message: "A request is already pending." });
+            }
+            if (existingRequest.status === "accepted") {
+                return res.status(400).json({ message: "User is already in your contacts." });
+            }
+            if (existingRequest.status === "rejected") {
+                // Prevent duplicate spam: If rejected by the OTHER person, allow re-send after 24h?
+                // For now, adhere to "don't allow User B to send another one immediately"
+                const hourDiff = (new Date() - new Date(existingRequest.updatedAt)) / (1000 * 60 * 60);
+                if (hourDiff < 24) {
+                    return res.status(403).json({ message: "Request was recently declined. Please try again later." });
+                }
+                // Reset to pending if enough time passed
+                existingRequest.status = "pending";
+                existingRequest.sender = myId;
+                existingRequest.receiver = targetUserId;
+                await existingRequest.save();
+                
+                // Update user arrays for active UI tracking
+                await Promise.all([
+                    userModel.findByIdAndUpdate(myId, { $addToSet: { outgoingRequests: targetUserId } }),
+                    userModel.findByIdAndUpdate(targetUserId, { $addToSet: { incomingRequests: myId } })
+                ]);
+
+                return res.status(200).json({ message: "Request re-sent." });
+            }
+        }
+
+        // Create new request
+        await ContactRequest.create({ sender: myId, receiver: targetUserId, status: "pending" });
+
+        // Update User models for active tracking
         const [sender, receiver] = await Promise.all([
-            userModel.findById(myId),
-            userModel.findById(targetUserId)
+            userModel.findByIdAndUpdate(myId, { $addToSet: { outgoingRequests: targetUserId } }, { new: true }),
+            userModel.findByIdAndUpdate(targetUserId, { $addToSet: { incomingRequests: myId } })
         ]);
-
-        if (!receiver) return res.status(404).json({ message: "User not found." });
-
-        // Ensure fields exist
-        if (!sender.contacts) sender.contacts = [];
-        if (!sender.outgoingRequests) sender.outgoingRequests = [];
-        if (!receiver.incomingRequests) receiver.incomingRequests = [];
-
-        if (sender.contacts.includes(targetUserId)) return res.status(400).json({ message: "Already in contacts." });
-        if (sender.outgoingRequests.includes(targetUserId)) return res.status(400).json({ message: "Request already pending." });
-
-        // Update both sides
-        sender.outgoingRequests.push(targetUserId);
-        receiver.incomingRequests.push(myId);
-
-        await Promise.all([sender.save(), receiver.save()]);
 
         res.status(200).json({ message: "Request sent successfully.", outgoingRequests: sender.outgoingRequests });
     } catch (err) {
@@ -41,27 +68,28 @@ export const sendRequest = async (req, res) => {
 export const acceptRequest = async (req, res) => {
     try {
         const { targetUserId } = req.body;
-        const myId = req.user.id; // Corrected from _id
+        const myId = req.user.id;
 
+        // 1. Update the Friendship Table status
+        const request = await ContactRequest.findOneAndUpdate(
+            { sender: targetUserId, receiver: myId, status: "pending" },
+            { status: "accepted" },
+            { new: true }
+        );
+
+        if (!request) return res.status(404).json({ message: "No pending request found." });
+
+        // 2. Clear from active request arrays and add to contacts
         const [me, other] = await Promise.all([
-            userModel.findById(myId),
-            userModel.findById(targetUserId)
+            userModel.findByIdAndUpdate(myId, {
+                $pull: { incomingRequests: targetUserId },
+                $addToSet: { contacts: targetUserId }
+            }, { new: true }),
+            userModel.findByIdAndUpdate(targetUserId, {
+                $pull: { outgoingRequests: myId },
+                $addToSet: { contacts: myId }
+            })
         ]);
-
-        if (!me.incomingRequests.includes(targetUserId)) return res.status(400).json({ message: "No pending request." });
-
-        // Remove from requests
-        me.incomingRequests = me.incomingRequests.filter(id => id.toString() !== targetUserId.toString());
-        other.outgoingRequests = other.outgoingRequests.filter(id => id.toString() !== myId.toString());
-
-        // Add to contacts
-        if (!me.contacts) me.contacts = [];
-        if (!other.contacts) other.contacts = [];
-        
-        me.contacts.push(targetUserId);
-        other.contacts.push(myId);
-
-        await Promise.all([me.save(), other.save()]);
 
         res.status(200).json({ message: "Request accepted.", contacts: me.contacts });
     } catch (err) {
@@ -74,19 +102,24 @@ export const acceptRequest = async (req, res) => {
 export const rejectRequest = async (req, res) => {
     try {
         const { targetUserId } = req.body;
-        const myId = req.user.id; // Corrected from _id
+        const myId = req.user.id;
 
-        const [me, other] = await Promise.all([
-            userModel.findById(myId),
-            userModel.findById(targetUserId)
+        // 1. HARD PART: Update rather than Delete
+        const request = await ContactRequest.findOneAndUpdate(
+            { sender: targetUserId, receiver: myId, status: "pending" },
+            { status: "rejected" },
+            { new: true }
+        );
+
+        if (!request) return res.status(404).json({ message: "Request not found." });
+
+        // 2. Remove from active tracking arrays, but keep the record in ContactRequest
+        await Promise.all([
+            userModel.findByIdAndUpdate(myId, { $pull: { incomingRequests: targetUserId } }),
+            userModel.findByIdAndUpdate(targetUserId, { $pull: { outgoingRequests: myId } })
         ]);
 
-        me.incomingRequests = me.incomingRequests.filter(id => id.toString() !== targetUserId.toString());
-        other.outgoingRequests = other.outgoingRequests.filter(id => id.toString() !== myId.toString());
-
-        await Promise.all([me.save(), other.save()]);
-
-        res.status(200).json({ message: "Request rejected." });
+        res.status(200).json({ message: "Request rejected successfully." });
     } catch (err) {
         console.error("rejectRequest error:", err);
         res.status(500).json({ message: err.message });
@@ -104,17 +137,39 @@ export const getContacts = async (req, res) => {
     }
 };
 
-// ── Get Requests ─────────────────────────────────────────────
+// ── Get Requests (Enhanced with History) ─────────────────────
 export const getRequests = async (req, res) => {
     try {
-        const user = await userModel.findById(req.user.id)
-            .populate("incomingRequests", "name email profilePic")
-            .populate("outgoingRequests", "name email profilePic");
+        const myId = req.user.id;
         
-        res.status(200).json({
-            incoming: user.incomingRequests || [],
-            outgoing: user.outgoingRequests || []
+        // Fetch all records where user is involved
+        const allRequests = await ContactRequest.find({
+            $or: [{ sender: myId }, { receiver: myId }]
+        }).populate("sender receiver", "name email profilePic");
+
+        const incoming = [];
+        const outgoing = [];
+        const history = [];
+
+        allRequests.forEach(reqDoc => {
+            const isSender = reqDoc.sender._id.toString() === myId;
+            const otherUser = isSender ? reqDoc.receiver : reqDoc.sender;
+
+            if (reqDoc.status === "pending") {
+                if (isSender) outgoing.push(otherUser);
+                else incoming.push(otherUser);
+            } else {
+                // Add to history list with labels
+                history.push({
+                    user: otherUser,
+                    status: reqDoc.status,
+                    type: isSender ? "outgoing" : "incoming",
+                    at: reqDoc.updatedAt
+                });
+            }
         });
+
+        res.status(200).json({ incoming, outgoing, history });
     } catch (err) {
         console.error("getRequests error:", err);
         res.status(500).json({ message: err.message });
@@ -137,7 +192,7 @@ export const searchUsers = async (req, res) => {
                     ]
                 }
             ]
-        }).select("name email profilePic contacts incomingRequests outgoingRequests").limit(10);
+        }).select("name email profilePic").limit(10);
 
         res.status(200).json(users);
     } catch (err) {
